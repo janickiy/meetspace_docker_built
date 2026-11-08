@@ -1,0 +1,189 @@
+name: Build server Docker packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New immutable version (vX.Y.Z or vX.Y.Z-suffix)
+        required: true
+        type: string
+      source_ref:
+        description: Backend main or a full 40-character commit SHA
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize complete publications so an older build cannot overtake a newer build.
+# Both native architectures still build in parallel within one run.
+concurrency:
+  group: meetspace-server-package-publication
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Validate operator inputs
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$GITHUB_REPOSITORY" == janickiy/meetspace_docker_built ]]
+          [[ ${#VERSION} -le 64 && "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          [[ "$SOURCE_REF" == main || "$SOURCE_REF" =~ ^[a-f0-9]{40}$ ]]
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test artifact metadata checks
+        run: python3 -I scripts/test_release_metadata.py
+      - name: Resolve public backend source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: janickiy/meet-space
+          ref: ${{ inputs.source_ref }}
+          path: backend
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Freeze reviewed backend commit
+        id: source
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          [[ "$commit" =~ ^[a-f0-9]{40}$ ]]
+          git merge-base --is-ancestor a8274df8e29be96fd13083202e9adaebe9c5f9b1 "$commit"
+          [[ -z "$(git status --porcelain)" ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Create a new draft release
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'This release already exists; choose a new immutable version.' >&2
+            exit 1
+          fi
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
+            "${prerelease[@]}" --title "MeetSpace server $VERSION" \
+            --notes "Built from janickiy/meet-space commit $SOURCE_COMMIT. Both native architectures must pass security checks before publication."
+
+  build:
+    needs: prepare
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Checkout the frozen backend commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: janickiy/meet-space
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          path: backend
+          persist-credentials: false
+      - name: Free disposable runner space
+        run: |
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+          df -h /
+      - name: Install release tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep jq
+      - name: Test backend release security gates
+        working-directory: backend
+        run: python3 -I scripts/release/test_package_security_collection.py
+      - name: Build and scan immutable Docker images
+        working-directory: backend
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          ARCH: ${{ matrix.arch }}
+          TRIVY_IMAGE: aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" && -z "$(git status --porcelain)" ]]
+          mkdir -p "$RUNNER_TEMP/meetspace-release"
+          bash scripts/release/build.sh --version "$VERSION" --commit "$SOURCE_COMMIT" \
+            --registry "meetspace-source-${SOURCE_COMMIT:0:12}" --layout hardened-shared-host \
+            --platform "linux/$ARCH" --output "$RUNNER_TEMP/meetspace-release/build"
+          if ! bash scripts/release/package.sh --build "$RUNNER_TEMP/meetspace-release/build/build.json" \
+            --mode archive --collect-security-failures --output "$RUNNER_TEMP/meetspace-release/package"; then
+            for report in "$RUNNER_TEMP/meetspace-release/package/"*.scan.json; do
+              [[ -f "$report" ]] || continue
+              jq -r '.Results[]? | .Target as $target | .Vulnerabilities[]? |
+                [$target, .VulnerabilityID, .PkgName, .InstalledVersion, .FixedVersion, .Severity] | @tsv' "$report"
+            done
+            exit 1
+          fi
+          python3 -I scripts/release/prebuilt-bundle.py --package "$RUNNER_TEMP/meetspace-release/package" \
+            --output "$RUNNER_TEMP/meetspace-release/output"
+      - name: Bind archive metadata to this package repository
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          python3 -I scripts/release_metadata.py rebind \
+            --directory "$RUNNER_TEMP/meetspace-release/output" \
+            --version "$VERSION" --commit "$SOURCE_COMMIT" --arch "$ARCH"
+      - name: Upload verified architecture bundle
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$VERSION" "$RUNNER_TEMP/meetspace-release/output/"*.tar.gz \
+            "$RUNNER_TEMP/meetspace-release/output/"*.sha256 \
+            "$RUNNER_TEMP/meetspace-release/output/"prebuilt-*.json --repo "$GITHUB_REPOSITORY"
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Publish only after both architectures pass
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/release-index"
+          gh release download "$VERSION" --pattern 'prebuilt-*.json' \
+            --dir "$RUNNER_TEMP/release-index" --repo "$GITHUB_REPOSITORY"
+          # Draft tags are not consistently available through releases/tags; list includes drafts owned by this token.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$VERSION\")" > "$RUNNER_TEMP/release-metadata.json"
+          python3 -I scripts/release_metadata.py index --directory "$RUNNER_TEMP/release-index" \
+            --version "$VERSION" --commit "$SOURCE_COMMIT" \
+            --release-metadata "$RUNNER_TEMP/release-metadata.json"
+          gh release upload "$VERSION" "$RUNNER_TEMP/release-index/prebuilt.json" --repo "$GITHUB_REPOSITORY"
+          gh release edit "$VERSION" --draft=false --repo "$GITHUB_REPOSITORY"
