@@ -92,7 +92,8 @@ class ReleaseMetadataTests(unittest.TestCase):
         assets = [dict(name=m.archive_name(self.version, arch), state='uploaded',
                        size=row['sizeBytes'], digest='sha256:' + row['sha256'], browser_download_url=row['url'])
                   for arch in m.ARCHITECTURES for row in [index['platforms']['linux/' + arch]]]
-        release = dict(tag_name=self.version, assets=assets)
+        release = dict(tag_name=self.version, draft=False, assets=assets,
+                       html_url=f'https://github.com/{m.REPOSITORY}/releases/tag/{self.version}')
         self.assertEqual(index, m.build_index(self.root, self.version, self.commit, release))
         for key, value in [('size', 1), ('digest', 'sha256:' + '0' * 64),
                            ('browser_download_url', 'https://github.com/other/repo/archive.tar.gz'), ('state', 'new')]:
@@ -103,6 +104,37 @@ class ReleaseMetadataTests(unittest.TestCase):
                     m.build_index(self.root, self.version, self.commit, changed)
         with self.assertRaises(ValueError):
             m.build_index(self.root, self.version, self.commit, dict(release, assets=assets[:1]))
+
+    def test_draft_assets_bind_to_the_same_draft_then_require_final_published_urls(self):
+        index = self.both()
+        original_bytes = (self.root / 'prebuilt.json').read_bytes()
+        draft_tag = 'untagged-b44b5481275aef6a732b'
+        assets = [dict(name=m.archive_name(self.version, arch), state='uploaded',
+                       size=row['sizeBytes'], digest='sha256:' + row['sha256'],
+                       browser_download_url=row['url'].replace('/download/' + self.version + '/', '/download/' + draft_tag + '/'))
+                  for arch in m.ARCHITECTURES for row in [index['platforms']['linux/' + arch]]]
+        release = dict(tag_name=self.version, draft=True, assets=assets,
+                       html_url=f'https://github.com/{m.REPOSITORY}/releases/tag/{draft_tag}')
+        self.assertEqual(index, m.build_index(self.root, self.version, self.commit, release))
+        self.assertEqual(original_bytes, (self.root / 'prebuilt.json').read_bytes())
+        for key, value in [('html_url', release['html_url'].replace(draft_tag, 'untagged-' + 'f' * 20)),
+                           ('html_url', release['html_url'].replace(m.REPOSITORY, 'other/repo')),
+                           ('html_url', release['html_url'] + '/other'), ('draft', 'true'),
+                           ('tag_name', 'v9.9.9'), ('draft', False)]:
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                m.build_index(self.root, self.version, self.commit, dict(release, **{key: value}))
+        with self.assertRaisesRegex(ValueError, 'still a draft'):
+            m.build_index(self.root, self.version, self.commit, release, require_published=True)
+        with self.assertRaisesRegex(ValueError, 'requires GitHub release metadata'):
+            m.build_index(self.root, self.version, self.commit, require_published=True)
+        published = copy.deepcopy(release)
+        published.update(draft=False, html_url=release['html_url'].replace(draft_tag, self.version))
+        with self.assertRaisesRegex(ValueError, 'URL differs'):
+            m.build_index(self.root, self.version, self.commit, published, require_published=True)
+        for asset in published['assets']:
+            asset['browser_download_url'] = asset['browser_download_url'].replace('/download/' + draft_tag + '/', '/download/' + self.version + '/')
+        self.assertEqual(index, m.build_index(self.root, self.version, self.commit, published, require_published=True))
+        self.assertEqual(original_bytes, (self.root / 'prebuilt.json').read_bytes())
 
     def test_concrete_versions_and_unambiguous_json_required(self):
         for version in ('latest', 'v1.0.0/../../other', '--help'):

@@ -187,3 +187,8 @@ jobs:
             --release-metadata "$RUNNER_TEMP/release-metadata.json"
           gh release upload "$VERSION" "$RUNNER_TEMP/release-index/prebuilt.json" --repo "$GITHUB_REPOSITORY"
           gh release edit "$VERSION" --draft=false --repo "$GITHUB_REPOSITORY"
+          # Published URLs must now use the concrete version, never the temporary draft URL.
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION" > "$RUNNER_TEMP/published-release-metadata.json"
+          python3 -I scripts/release_metadata.py index --directory "$RUNNER_TEMP/release-index" \
+            --version "$VERSION" --commit "$SOURCE_COMMIT" --published \
+            --release-metadata "$RUNNER_TEMP/published-release-metadata.json"

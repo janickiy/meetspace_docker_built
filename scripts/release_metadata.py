@@ -95,20 +95,36 @@ def rebind(directory, version, commit, arch):
     return item
 
 
-def validate_uploaded_asset(release, version, arch, archive):
+def validate_uploaded_asset(release, version, arch, archive, *, require_published=False):
     require(isinstance(release, dict) and release.get('tag_name') == version
-            and isinstance(release.get('assets'), list), 'Unexpected GitHub release metadata')
+            and type(release.get('draft')) is bool and isinstance(release.get('assets'), list),
+            'Unexpected GitHub release metadata')
+    require(not require_published or release['draft'] is False, 'GitHub release is still a draft')
+    tag_prefix = f'https://github.com/{REPOSITORY}/releases/tag/'
+    html_url = release.get('html_url')
+    require(isinstance(html_url, str) and html_url.startswith(tag_prefix),
+            'Unexpected GitHub release origin')
+    download_tag = html_url[len(tag_prefix):]
+    if release['draft']:
+        # GitHub gives an unpublished release an untagged URL. Bind assets to
+        # that exact draft, while external descriptors keep immutable version URLs.
+        require(download_tag == version or re.fullmatch(r'untagged-[a-f0-9]{20,40}', download_tag),
+                'Unexpected GitHub draft URL')
+    else:
+        require(download_tag == version, 'Published release URL differs from the requested version')
+    expected_url = f'https://github.com/{REPOSITORY}/releases/download/{download_tag}/{archive_name(version, arch)}'
     matches = [asset for asset in release['assets'] if asset.get('name') == archive_name(version, arch)]
     require(len(matches) == 1, 'Published archive is missing or duplicated')
     asset = matches[0]
     require(asset.get('state') == 'uploaded' and asset.get('size') == archive['sizeBytes']
-            and asset.get('browser_download_url') == archive['url']
+            and asset.get('browser_download_url') == expected_url
             and asset.get('digest') == 'sha256:' + archive['sha256'],
             'GitHub archive size, digest, or URL differs from the verified descriptor')
 
 
-def build_index(directory, version, commit, release=None):
+def build_index(directory, version, commit, release=None, *, require_published=False):
     identity(version, commit)
+    require(not require_published or release is not None, 'Published validation requires GitHub release metadata')
     index = dict(schemaVersion=1, serviceInventoryVersion=2, installationMode='prebuilt',
                  repository=REPOSITORY, sourceRepository=SOURCE_REPOSITORY,
                  version=version, commit=commit, platforms={})
@@ -116,7 +132,7 @@ def build_index(directory, version, commit, release=None):
         item = read_json(directory / ('prebuilt-' + arch + '.json'))
         archive = validate_descriptor(item, version, commit, arch)
         if release is not None:
-            validate_uploaded_asset(release, version, arch, archive)
+            validate_uploaded_asset(release, version, arch, archive, require_published=require_published)
         index['platforms']['linux/' + arch] = archive
     write_json(directory / 'prebuilt.json', index)
     return index
@@ -130,14 +146,16 @@ def main():
     parser.add_argument('--commit', required=True)
     parser.add_argument('--arch', choices=ARCHITECTURES)
     parser.add_argument('--release-metadata', type=Path)
+    parser.add_argument('--published', action='store_true', help='Require final, published release URLs')
     args = parser.parse_args()
     if args.action == 'rebind':
-        require(args.arch is not None and args.release_metadata is None, 'rebind requires --arch only')
+        require(args.arch is not None and args.release_metadata is None and not args.published,
+                'rebind requires --arch only')
         rebind(args.directory, args.version, args.commit, args.arch)
     else:
         require(args.arch is None, 'index requires both architectures')
         release = read_json(args.release_metadata) if args.release_metadata else None
-        build_index(args.directory, args.version, args.commit, release)
+        build_index(args.directory, args.version, args.commit, release, require_published=args.published)
     print('Verified release metadata:', args.action, args.version)
 
 
