@@ -1,15 +1,17 @@
 name: Build server Docker packages
 
 on:
+  schedule:
+    - cron: '17,47 * * * *'
   workflow_dispatch:
     inputs:
       version:
-        description: New immutable version (vX.Y.Z or vX.Y.Z-suffix)
-        required: true
+        description: Optional version override (vX.Y.Z or vX.Y.Z-suffix)
+        required: false
         type: string
       source_ref:
         description: Backend main or a full 40-character commit SHA
-        required: true
+        required: false
         default: main
         type: string
 
@@ -29,16 +31,20 @@ jobs:
       contents: write
     outputs:
       source_commit: ${{ steps.source.outputs.commit }}
+      version: ${{ steps.release.outputs.version }}
+      build: ${{ steps.release.outputs.build }}
     steps:
       - name: Validate operator inputs
         env:
           VERSION: ${{ inputs.version }}
-          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REF: ${{ inputs.source_ref || 'main' }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_REF" == refs/heads/main ]]
           [[ "$GITHUB_REPOSITORY" == janickiy/meetspace_docker_built ]]
-          [[ ${#VERSION} -le 64 && "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          if [[ -n "$VERSION" ]]; then
+            [[ ${#VERSION} -le 64 && "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          fi
           [[ "$SOURCE_REF" == main || "$SOURCE_REF" =~ ^[a-f0-9]{40}$ ]]
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -49,7 +55,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: janickiy/meet-space
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ inputs.source_ref || 'main' }}
           path: backend
           fetch-depth: 0
           persist-credentials: false
@@ -61,27 +67,53 @@ jobs:
           commit="$(git rev-parse HEAD)"
           [[ "$commit" =~ ^[a-f0-9]{40}$ ]]
           git merge-base --is-ancestor a8274df8e29be96fd13083202e9adaebe9c5f9b1 "$commit"
+          git merge-base --is-ancestor "$commit" refs/remotes/origin/main
           [[ -z "$(git status --porcelain)" ]]
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-      - name: Create a new draft release
+      - name: Reuse an existing package or prepare a draft
+        id: release
         env:
           VERSION: ${{ inputs.version }}
           SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo 'This release already exists; choose a new immutable version.' >&2
-            exit 1
+          if [[ -z "$VERSION" ]]; then
+            VERSION="v0.6.2-prebuilt.${SOURCE_COMMIT:0:12}"
           fi
-          prerelease=()
-          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
-          gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
-            "${prerelease[@]}" --title "MeetSpace server $VERSION" \
-            --notes "Built from janickiy/meet-space commit $SOURCE_COMMIT. Both native architectures must pass security checks before publication."
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+          note="Built from janickiy/meet-space commit $SOURCE_COMMIT."
+          metadata="$RUNNER_TEMP/existing-release.json"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$VERSION\")" > "$metadata"
+          if [[ -s "$metadata" ]]; then
+            jq -e --arg note "$note" '.body | startswith($note)' "$metadata" >/dev/null
+            if jq -e '.draft == false' "$metadata" >/dev/null; then
+              directory="$RUNNER_TEMP/existing-index"
+              mkdir "$directory"
+              gh release download "$VERSION" --pattern 'prebuilt*.json' \
+                --dir "$directory" --repo "$GITHUB_REPOSITORY"
+              mv "$directory/prebuilt.json" "$directory/published.json"
+              python3 -I scripts/release_metadata.py index --directory "$directory" \
+                --version "$VERSION" --commit "$SOURCE_COMMIT" --published --release-metadata "$metadata"
+              jq -e --slurp 'length == 2 and .[0] == .[1]' \
+                "$directory/published.json" "$directory/prebuilt.json" >/dev/null
+              echo "Package for $SOURCE_COMMIT is already published as $VERSION."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            prerelease=()
+            if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
+            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
+              "${prerelease[@]}" --title "MeetSpace server $VERSION" \
+              --notes "$note Both native architectures must pass security checks before publication."
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
+    if: needs.prepare.outputs.build == 'true'
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -120,7 +152,7 @@ jobs:
       - name: Build and scan immutable Docker images
         working-directory: backend
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           ARCH: ${{ matrix.arch }}
           TRIVY_IMAGE: aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
@@ -144,7 +176,7 @@ jobs:
             --output "$RUNNER_TEMP/meetspace-release/output"
       - name: Bind archive metadata to this package repository
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           ARCH: ${{ matrix.arch }}
         run: |
@@ -153,12 +185,18 @@ jobs:
             --version "$VERSION" --commit "$SOURCE_COMMIT" --arch "$ARCH"
       - name: Upload verified architecture bundle
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$VERSION\")" |
+            jq -es --arg note "Built from janickiy/meet-space commit $SOURCE_COMMIT." \
+              'length == 1 and (.[0] | .draft and (.body | startswith($note)))' >/dev/null
           gh release upload "$VERSION" "$RUNNER_TEMP/meetspace-release/output/"*.tar.gz \
             "$RUNNER_TEMP/meetspace-release/output/"*.sha256 \
-            "$RUNNER_TEMP/meetspace-release/output/"prebuilt-*.json --repo "$GITHUB_REPOSITORY"
+            "$RUNNER_TEMP/meetspace-release/output/"prebuilt-*.json --repo "$GITHUB_REPOSITORY" --clobber
 
   publish:
     needs: [prepare, build]
@@ -171,7 +209,7 @@ jobs:
           persist-credentials: false
       - name: Publish only after both architectures pass
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -182,10 +220,12 @@ jobs:
           # Draft tags are not consistently available through releases/tags; list includes drafts owned by this token.
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq ".[] | select(.tag_name == \"$VERSION\")" > "$RUNNER_TEMP/release-metadata.json"
+          jq -e --arg note "Built from janickiy/meet-space commit $SOURCE_COMMIT." \
+            '.draft and (.body | startswith($note))' "$RUNNER_TEMP/release-metadata.json" >/dev/null
           python3 -I scripts/release_metadata.py index --directory "$RUNNER_TEMP/release-index" \
             --version "$VERSION" --commit "$SOURCE_COMMIT" \
             --release-metadata "$RUNNER_TEMP/release-metadata.json"
-          gh release upload "$VERSION" "$RUNNER_TEMP/release-index/prebuilt.json" --repo "$GITHUB_REPOSITORY"
+          gh release upload "$VERSION" "$RUNNER_TEMP/release-index/prebuilt.json" --repo "$GITHUB_REPOSITORY" --clobber
           gh release edit "$VERSION" --draft=false --repo "$GITHUB_REPOSITORY"
           # Published URLs must now use the concrete version, never the temporary draft URL.
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION" > "$RUNNER_TEMP/published-release-metadata.json"
